@@ -1,0 +1,175 @@
+---
+title: "Clickstream Analysis"
+author: "Bahareh Jozranjbar"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Install required packages (Uncomment if needed)
+# install.packages(c("data.table", "randomForest", "caret", "survival", "survminer", "ROSE", "keras", "tensorflow", "ggthemes", "scales"))
+
+# Load necessary libraries
+library(data.table)
+library(randomForest)
+library(caret)
+library(ggplot2)
+library(survival)
+library(survminer)
+library(ROSE)
+library(keras)
+library(reshape2)
+library(gridExtra)
+library(ggthemes)
+library(scales)
+library(forecast)
+
+```
+
+📌 Load and Prepare Data
+
+```{r}
+# Download and load data
+download.file("https://analyse.kmi.open.ac.uk/resources/documents/mashupData.RData",
+              destfile = "./mashupData.RData",
+              mode = "wb", quiet = TRUE)
+
+load("mashupData.RData")
+
+# Aggregate clickstream data (Total Clicks per Student)
+clickstream_summary <- studentVle[, .(
+    total_clicks = sum(sum_click),
+    avg_clicks_per_day = mean(sum_click),
+    engagement_days = .N
+), by = id_student]
+
+# Merge with student performance (Final Assessment Scores)
+student_performance <- studentAssessment[, .(
+    avg_score = mean(score, na.rm = TRUE)
+), by = id_student]
+
+# Merge datasets
+merged_data <- merge(clickstream_summary, student_performance, by = "id_student")
+
+# Convert scores into pass/fail labels
+merged_data[, pass_fail := ifelse(avg_score >= 40, "Pass", "Fail")]
+
+# Ensure factor levels for pass/fail
+merged_data$pass_fail <- factor(merged_data$pass_fail, levels = c("Fail", "Pass"))
+
+```
+
+📌 Train a Random Forest Model for Student Success Prediction
+```{r}
+## Split data into training and test sets
+set.seed(123)
+train_index <- createDataPartition(merged_data$pass_fail, p = 0.8, list = FALSE)
+train_data <- merged_data[train_index, ]
+test_data <- merged_data[-train_index, ]
+
+# Handle class imbalance using ROSE (Random Over-Sampling)
+train_balanced <- ROSE(pass_fail ~ ., data = train_data, seed = 123)$data
+
+# Train the Random Forest model
+rf_model <- randomForest(as.factor(pass_fail) ~ total_clicks + avg_clicks_per_day + engagement_days,
+                         data = train_balanced, ntree = 100, importance = TRUE)
+
+# Extract feature importance
+feature_importance <- as.data.frame(importance(rf_model))
+feature_importance$Feature <- rownames(feature_importance)
+feature_importance <- feature_importance[order(-feature_importance$MeanDecreaseGini),]
+
+# Export Feature Importance Plot
+png("feature_importance_rf.png", width = 1200, height = 800, bg = "transparent")
+ggplot(feature_importance, aes(x = reorder(Feature, MeanDecreaseGini), y = MeanDecreaseGini)) +
+    geom_col(fill = "#0073C2FF") +
+    coord_flip() +
+    labs(title = "Feature Importance in Random Forest Model",
+         x = "Feature",
+         y = "Importance (Mean Decrease in Gini)") +
+    theme_minimal(base_size = 20) +
+    theme(plot.title = element_text(size = 24, face = "bold"),
+          axis.text.x = element_text(size = 16),
+          axis.text.y = element_text(size = 18))
+dev.off()
+
+```
+📌 Survival Analysis: Dropout Prediction
+```{r}
+# Prepare dropout survival data
+student_dropout <- studentRegistration[, .(
+    id_student,
+    time_to_dropout = ifelse(is.na(date_unregistration), 100, date_unregistration),
+    dropout_event = ifelse(is.na(date_unregistration), 0, 1)
+)]
+
+# Kaplan-Meier Survival Analysis
+km_fit <- survfit(Surv(time_to_dropout, dropout_event) ~ 1, data = student_dropout)
+
+# Export Kaplan-Meier Curve
+png("km_survival_plot.png", width = 1200, height = 800, bg = "transparent")
+ggsurvplot(km_fit, data = student_dropout, 
+           title = "Kaplan-Meier Survival Curve for Dropout",
+           risk.table = TRUE, 
+           conf.int = TRUE,
+           ggtheme = theme_minimal(base_size = 20),
+           surv.median.line = "hv")
+dev.off()
+
+# Cox Proportional Hazards Model
+cox_data <- merge(merged_data, student_dropout, by = "id_student")
+cox_model <- coxph(Surv(time_to_dropout, dropout_event) ~ total_clicks + avg_clicks_per_day, data = cox_data)
+summary(cox_model)
+
+```
+📌 Export Clickstream Trends Over Time
+```{r}
+# Export Clickstream Trends Plot
+png("clickstream_trends.png", width = 1200, height = 800, bg = "transparent")
+ggplot(clickstream_summary, aes(x = avg_clicks_per_day, y = total_clicks)) +
+    geom_point(alpha = 0.6, color = "#0073C2FF") +
+    geom_smooth(method = "lm", color = "#E69F00", se = FALSE, size = 2) +
+    labs(title = "Clickstream Trends: Engagement vs. Total Clicks",
+         x = "Average Clicks per Day", y = "Total Clicks") +
+    theme_minimal(base_size = 20) +
+    theme(plot.title = element_text(size = 24, face = "bold"),
+          axis.text.x = element_text(size = 16),
+          axis.text.y = element_text(size = 18))
+dev.off()
+
+```
+
+📌  Predict future engagement using Time-Series (ARIMA)
+```{r}
+
+
+# Convert total clicks into time series format
+ts_data <- ts(clickstream_summary$total_clicks, frequency = 30)
+
+# Train an ARIMA model to forecast future engagement trends
+arima_model <- auto.arima(ts_data)
+
+# Predict next 10 periods
+forecast_values <- forecast(arima_model, h = 10)
+
+# Save Forecast Plot
+png("clickstream_forecast.png", width = 6, height = 4, units = "in", res = 300, bg = "transparent")
+autoplot(forecast_values) +
+    ggtitle("Forecasting Clickstream Trends") +
+    xlab("Time") + 
+    ylab("Predicted Total Clicks") +
+    theme_minimal(base_size = 14) +
+    theme(axis.text = element_text(size = 14), axis.title = element_text(size = 16), 
+          plot.title = element_text(size = 18, face = "bold"))
+dev.off()
+
+
+```
+
+
+
+
